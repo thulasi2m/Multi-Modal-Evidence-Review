@@ -1,25 +1,36 @@
-import pandas as pd
+import csv
 import argparse
 import sys
 
+def read_csv_to_dicts(filepath):
+    with open(filepath, mode='r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        return list(reader)
+
 def evaluate(predictions_file, ground_truth_file, report_file):
     try:
-        preds = pd.read_csv(predictions_file)
-        truth = pd.read_csv(ground_truth_file)
+        preds = read_csv_to_dicts(predictions_file)
+        truth = read_csv_to_dicts(ground_truth_file)
     except Exception as e:
         print(f"Error reading files: {e}")
         sys.exit(1)
 
-    merged = preds.merge(truth, on='user_id', suffixes=('_pred', '_truth'))
+    preds_dict = {p['user_id']: p for p in preds}
+    truth_dict = {t['user_id']: t for t in truth}
     
+    merged = []
+    for uid, t in truth_dict.items():
+        if uid in preds_dict:
+            merged.append({'truth': t, 'pred': preds_dict[uid]})
+            
     total = len(merged)
     if total == 0:
         print("No matching rows found for evaluation.")
         sys.exit(1)
         
-    status_match = (merged['claim_status_pred'] == merged['claim_status_truth']).sum()
-    evidence_match = (merged['evidence_standard_met_pred'].astype(str).str.lower() == merged['evidence_standard_met_truth'].astype(str).str.lower()).sum()
-    issue_match = (merged['issue_type_pred'] == merged['issue_type_truth']).sum()
+    status_match = sum(1 for m in merged if m['pred'].get('claim_status') == m['truth'].get('claim_status'))
+    evidence_match = sum(1 for m in merged if str(m['pred'].get('evidence_standard_met')).lower() == str(m['truth'].get('evidence_standard_met')).lower())
+    issue_match = sum(1 for m in merged if m['pred'].get('issue_type') == m['truth'].get('issue_type'))
 
     status_acc = status_match / total * 100
     evidence_acc = evidence_match / total * 100
