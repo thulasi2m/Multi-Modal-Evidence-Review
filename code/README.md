@@ -1,44 +1,20 @@
-# Multi-Modal Evidence Review System
+# Multi-Modal Evidence Review
 
-This directory contains the source code for processing damage claims using Google Gemini 2.0 Flash.
+## Approach Overview
+This system processes multi-modal damage claims (images, claim transcripts, user history, and evidence requirements).
+To bypass compilation issues on certain Python versions, the system was built natively using `google-genai` and standard Python libraries (`csv`, `json`, etc.) without relying on heavy frameworks like `pandas` or `pydantic`. 
 
-## Setup
+The system uses Gemini 2.0 Flash to analyze the images alongside the user chat transcripts and historical risk data to make a final determination (`supported`, `contradicted`, `not_enough_information`), outputting the results into a structured CSV format matching the required schema.
 
+## Setup Instructions
 1. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
-2. Set your Google Gemini API Key:
+2. Run the pipeline:
    ```bash
-   export GEMINI_API_KEY="your_api_key_here"
+   python main.py --api_key YOUR_GEMINI_API_KEY --claims ../dataset/claims.csv --history ../dataset/user_history.csv --rules ../dataset/evidence_requirements.csv --base_dir ../dataset --output output.csv
    ```
 
-## Running the System
-
-To process the full test set (`dataset/claims.csv`) and produce `output.csv`:
-
-```bash
-python main.py --claims ../dataset/claims.csv \
-               --history ../dataset/user_history.csv \
-               --rules ../dataset/evidence_requirements.csv \
-               --base_dir ../dataset \
-               --output ../output.csv
-```
-
-## Running Evaluation
-
-To evaluate the system against `sample_claims.csv`:
-
-1. First, generate predictions for the sample set:
-   ```bash
-   python main.py --claims ../dataset/sample_claims.csv \
-                  --history ../dataset/user_history.csv \
-                  --rules ../dataset/evidence_requirements.csv \
-                  --base_dir ../dataset \
-                  --output ../output.csv
-   ```
-2. Then run the evaluation script:
-   ```bash
-   cd evaluation
-   python main.py --preds ../../output.csv --truth ../../dataset/sample_claims.csv --report evaluation_report.md
-   ```
+## Evaluation Pipeline
+The system includes an evaluation script in `evaluation/main.py` which computes accuracy metrics for `claim_status`, `evidence_standard_met`, and `issue_type` against the ground truth sample claims.
