@@ -1,10 +1,11 @@
 import os
 import time
 import csv
-from google import genai
-from google.genai import types
+import json
+import base64
+import urllib.request
+import urllib.error
 
-# Define schema natively without pydantic, using dicts directly
 claim_schema = {
     "type": "OBJECT",
     "properties": {
@@ -23,7 +24,6 @@ claim_schema = {
 }
 
 def get_image_parts(image_paths_str: str, base_dir: str):
-    """Load images to pass to Gemini."""
     paths = image_paths_str.split(";")
     image_parts = []
     for path in paths:
@@ -33,8 +33,12 @@ def get_image_parts(image_paths_str: str, base_dir: str):
                 img_data = f.read()
                 ext = path.split('.')[-1].lower()
                 mime = "image/jpeg" if ext in ["jpg", "jpeg"] else "image/png"
-                # Fix: Use types.Part.from_bytes properly
-                image_parts.append(types.Part.from_bytes(data=img_data, mime_type=mime))
+                image_parts.append({
+                    "inlineData": {
+                        "mimeType": mime,
+                        "data": base64.b64encode(img_data).decode('utf-8')
+                    }
+                })
     return image_parts
 
 def read_csv_to_dicts(filepath):
@@ -42,18 +46,44 @@ def read_csv_to_dicts(filepath):
         reader = csv.DictReader(f)
         return list(reader)
 
+def generate_content_rest(api_key, model, contents_parts, system_instruction):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    
+    payload = {
+        "systemInstruction": {
+            "parts": [{"text": system_instruction}]
+        },
+        "contents": [{
+            "parts": contents_parts
+        }],
+        "generationConfig": {
+            "temperature": 0.0,
+            "responseMimeType": "application/json",
+            "responseSchema": claim_schema
+        }
+    }
+    
+    data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'}, method='POST')
+    
+    try:
+        with urllib.request.urlopen(req) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            text = result['candidates'][0]['content']['parts'][0]['text']
+            return text
+    except urllib.error.HTTPError as e:
+        error_msg = e.read().decode('utf-8')
+        raise Exception(f"HTTP {e.code}: {error_msg}")
+
 def process_claims(claims_file: str, history_file: str, rules_file: str, base_dir: str, out_file: str, api_key: str):
     if not api_key:
-        print("ERROR: No API key provided! Please pass your API key using --api_key")
+        print("ERROR: No API key provided!")
         return
 
-    # Initialize client with explicitly passed api_key
-    client = genai.Client(api_key=api_key)
-
+    working_model = 'gemini-2.5-flash'
     claims = read_csv_to_dicts(claims_file)
     history = read_csv_to_dicts(history_file)
     rules = read_csv_to_dicts(rules_file)
-
     output_rows = []
     
     system_instruction = """
@@ -64,84 +94,87 @@ def process_claims(claims_file: str, history_file: str, rules_file: str, base_di
     Risk flags: none, blurry_image, cropped_or_obstructed, low_light_or_glare, wrong_angle, wrong_object, wrong_object_part, damage_not_visible, claim_mismatch, possible_manipulation, non_original_image, text_instruction_present, user_history_risk, manual_review_required.
     """
 
+    quota_exhausted = False
+
     for row in claims:
         user_id = row['user_id']
         image_paths = row['image_paths']
         user_claim = row['user_claim']
         claim_object = row['claim_object']
 
-        # Get history context
+        if quota_exhausted:
+            # Skip API and just fill with generic response so the file finishes
+            print(f"Skipping API for {user_id} due to daily limit...")
+            fallback = {k: "error_quota_exceeded" for k in ["evidence_standard_met", "evidence_standard_met_reason", "risk_flags", "issue_type", "object_part", "claim_status", "claim_status_justification", "supporting_image_ids", "valid_image", "severity"]}
+            fallback['user_id'] = user_id
+            fallback['image_paths'] = image_paths
+            fallback['user_claim'] = user_claim
+            fallback['claim_object'] = claim_object
+            output_rows.append(fallback)
+            continue
+
         user_hist = [h for h in history if h['user_id'] == user_id]
         history_context = user_hist[0] if user_hist else "No history"
-        
-        # Determine rules context
         user_rules = [r for r in rules if r['claim_object'] in [claim_object, 'all']]
         rules_context = str(user_rules)
 
-        prompt = f"""
+        prompt_text = f"""
         User ID: {user_id}
         Object Type: {claim_object}
         Chat Transcript: {user_claim}
         User History: {history_context}
         Evidence Requirements: {rules_context}
-        Submitted Image Paths: {image_paths} (Image IDs are filenames without extensions)
-
-        Evaluate the claim and return the structured JSON output matching the schema.
+        Submitted Image Paths: {image_paths}
+        Evaluate the claim and return structured JSON output.
         """
         
-        contents = get_image_parts(image_paths, base_dir)
-        contents.append(prompt)
+        contents_parts = get_image_parts(image_paths, base_dir)
+        contents_parts.append({"text": prompt_text})
 
-        # Retry logic for rate limits
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = client.models.generate_content(
-                    model='gemini-2.0-flash',
-                    contents=contents,
-                    config={
-                        "system_instruction": system_instruction,
-                        "response_mime_type": "application/json",
-                        "response_schema": claim_schema,
-                        "temperature": 0.0
-                    },
-                )
-                
-                # Parse JSON output
-                out_data = response.text
-                import json
-                parsed = json.loads(out_data)
-                
-                output_row = {
-                    'user_id': user_id,
-                    'image_paths': image_paths,
-                    'user_claim': user_claim,
-                    'claim_object': claim_object,
-                    'evidence_standard_met': parsed.get('evidence_standard_met'),
-                    'evidence_standard_met_reason': parsed.get('evidence_standard_met_reason'),
-                    'risk_flags': parsed.get('risk_flags'),
-                    'issue_type': parsed.get('issue_type'),
-                    'object_part': parsed.get('object_part'),
-                    'claim_status': parsed.get('claim_status'),
-                    'claim_status_justification': parsed.get('claim_status_justification'),
-                    'supporting_image_ids': parsed.get('supporting_image_ids'),
-                    'valid_image': parsed.get('valid_image'),
-                    'severity': parsed.get('severity')
-                }
-                output_rows.append(output_row)
-                break
-            except Exception as e:
-                print(f"Error processing {user_id}: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-                else:
-                    # Fallback output
-                    fallback = {k: "error" for k in ["evidence_standard_met", "evidence_standard_met_reason", "risk_flags", "issue_type", "object_part", "claim_status", "claim_status_justification", "supporting_image_ids", "valid_image", "severity"]}
-                    fallback['user_id'] = user_id
-                    fallback['image_paths'] = image_paths
-                    fallback['user_claim'] = user_claim
-                    fallback['claim_object'] = claim_object
-                    output_rows.append(fallback)
+        try:
+            print(f"Processing {user_id} with {working_model}...")
+            out_data = generate_content_rest(api_key, working_model, contents_parts, system_instruction)
+            parsed = json.loads(out_data)
+            
+            output_row = {
+                'user_id': user_id,
+                'image_paths': image_paths,
+                'user_claim': user_claim,
+                'claim_object': claim_object,
+                'evidence_standard_met': parsed.get('evidence_standard_met'),
+                'evidence_standard_met_reason': parsed.get('evidence_standard_met_reason'),
+                'risk_flags': parsed.get('risk_flags'),
+                'issue_type': parsed.get('issue_type'),
+                'object_part': parsed.get('object_part'),
+                'claim_status': parsed.get('claim_status'),
+                'claim_status_justification': parsed.get('claim_status_justification'),
+                'supporting_image_ids': parsed.get('supporting_image_ids'),
+                'valid_image': parsed.get('valid_image'),
+                'severity': parsed.get('severity')
+            }
+            output_rows.append(output_row)
+            print(f"Success for {user_id}! Waiting 15 seconds to avoid minute limits...")
+            time.sleep(15) 
+        except Exception as e:
+            error_str = str(e)
+            print(f"Error for {user_id}: {error_str}")
+            if "GenerateRequestsPerDay" in error_str or "quotaValue\": \"20\"" in error_str:
+                print("DAILY QUOTA COMPLETELY EXHAUSTED! Skipping remaining rows.")
+                quota_exhausted = True
+                fallback = {k: "error_quota_exceeded" for k in ["evidence_standard_met", "evidence_standard_met_reason", "risk_flags", "issue_type", "object_part", "claim_status", "claim_status_justification", "supporting_image_ids", "valid_image", "severity"]}
+                fallback['user_id'] = user_id
+                fallback['image_paths'] = image_paths
+                fallback['user_claim'] = user_claim
+                fallback['claim_object'] = claim_object
+                output_rows.append(fallback)
+            else:
+                print("Temporary error, falling back...")
+                fallback = {k: "error" for k in ["evidence_standard_met", "evidence_standard_met_reason", "risk_flags", "issue_type", "object_part", "claim_status", "claim_status_justification", "supporting_image_ids", "valid_image", "severity"]}
+                fallback['user_id'] = user_id
+                fallback['image_paths'] = image_paths
+                fallback['user_claim'] = user_claim
+                fallback['claim_object'] = claim_object
+                output_rows.append(fallback)
     
     if output_rows:
         keys = output_rows[0].keys()
@@ -150,8 +183,6 @@ def process_claims(claims_file: str, history_file: str, rules_file: str, base_di
             dict_writer.writeheader()
             dict_writer.writerows(output_rows)
         print(f"Results saved to {out_file}")
-    else:
-        print("No claims processed.")
 
 if __name__ == "__main__":
     import argparse
@@ -163,8 +194,5 @@ if __name__ == "__main__":
     parser.add_argument('--output', default='../output.csv')
     parser.add_argument('--api_key', default='', help="Your Gemini API Key")
     args = parser.parse_args()
-    
-    # Check env var as fallback
     api_key = args.api_key if args.api_key else os.environ.get("GEMINI_API_KEY", "")
-    
     process_claims(args.claims, args.history, args.rules, args.base_dir, args.output, api_key)
